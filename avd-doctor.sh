@@ -13,6 +13,7 @@ set +x
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
+readonly VERSION="0.1.0"
 readonly API_VERSION="2024-04-03"
 readonly GRAPH_URL="https://graph.microsoft.com/v1.0"
 readonly LOOKBACK_HOURS=24
@@ -50,6 +51,7 @@ Optional:
   -u,  --upn <user@domain>       Test user UPN for connection/sign-in tracing
   -sh, --session-host <name>     Session host FQDN or VM name
        --guest-diagnostics       Opt in to VM Run Command guest diagnostics
+       --version                 Show version
   -h,  --help                    Show this help
 
 Control-plane checks are read-only. The optional --guest-diagnostics flag uses
@@ -175,6 +177,10 @@ parse_args() {
         GUEST_DIAGNOSTICS=true
         shift
         ;;
+      --version)
+        printf '%s %s\n' "$SCRIPT_NAME" "$VERSION"
+        exit 0
+        ;;
       -h|--help)
         usage
         exit 0
@@ -237,12 +243,15 @@ control_plane_audit() {
 
   local rdp_properties
   rdp_properties="$(jq -r '.customRdpProperty // ""' "$TMP_DIR/hostpool.json")"
-  if grep -Eqi '(^|;)targetisaadjoined:i:1(;|$)' <<<"$rdp_properties"; then
-    add_finding "control-plane" "PASS" "target-is-aad-joined" \
-      "Host pool RDP properties include targetisaadjoined:i:1."
+  if grep -Eqi '(^|;)enablerdsaadauth:i:1(;|$)' <<<"$rdp_properties"; then
+    add_finding "control-plane" "PASS" "entra-rdp-auth" \
+      "Host pool RDP properties enable Microsoft Entra authentication and single sign-on."
+  elif grep -Eqi '(^|;)targetisaadjoined:i:1(;|$)' <<<"$rdp_properties"; then
+    add_finding "control-plane" "WARN" "entra-rdp-auth" \
+      "Host pool uses legacy targetisaadjoined:i:1; review migration to enablerdsaadauth:i:1."
   else
-    add_finding "control-plane" "WARN" "target-is-aad-joined" \
-      "Host pool RDP properties do not include targetisaadjoined:i:1; verify this if hosts are Entra joined."
+    add_finding "control-plane" "INFO" "entra-rdp-auth" \
+      "Host pool RDP properties do not explicitly enable Microsoft Entra authentication; verify this matches the host-pool identity design."
   fi
 
   if capture_az "$TMP_DIR/sessionhosts-raw.json" "$TMP_DIR/sessionhosts.err" \
@@ -706,6 +715,7 @@ write_report() {
   }]' "$TMP_DIR/sessionhosts.json" >"$sanitized_hosts"
 
   jq -n \
+    --arg version "$VERSION" \
     --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg subscriptionId "$SUBSCRIPTION_ID" \
     --arg resourceGroup "$RESOURCE_GROUP" \
@@ -722,6 +732,7 @@ write_report() {
     --slurpfile guest "$TMP_DIR/guest-diagnostics.json" '
       {
         schemaVersion: "1.0",
+        toolVersion: $version,
         generatedAtUtc: $generatedAt,
         scope: {
           subscriptionId: $subscriptionId,

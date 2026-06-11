@@ -1,24 +1,29 @@
 # AVD Doctor
 
-AVD Doctor is an Azure Virtual Desktop diagnostic collector designed to run in
-Azure Cloud Shell.
+AVD Doctor is a portable Azure Virtual Desktop diagnostic collector designed to
+run in Azure Cloud Shell. It performs control-plane, monitoring, identity, and
+optional session-host checks without applying remediation changes.
+
+## Requirements
+
+- Azure Cloud Shell using Bash
+- An authenticated Azure CLI session
+- `jq`
+- Azure and Microsoft Entra permissions for the selected checks
 
 ## Download in Azure Cloud Shell
 
-This repository is private, so the download requires a GitHub token with
-read-only access to the repository contents.
+```bash
+curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.0/avd-doctor.sh
+chmod +x avd-doctor.sh
+```
+
+Review scripts before executing them in a privileged environment.
+
+Check the downloaded version:
 
 ```bash
-read -rsp "GitHub token: " GITHUB_TOKEN && echo
-
-curl -fsSL \
-  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-  -H "Accept: application/vnd.github.raw+json" \
-  "https://api.github.com/repos/marsillig/AVD-Doctor/contents/avd-doctor.sh" \
-  -o avd-doctor.sh
-
-unset GITHUB_TOKEN
-chmod +x avd-doctor.sh
+./avd-doctor.sh --version
 ```
 
 ## Run
@@ -42,11 +47,18 @@ To include guest-side checks on a selected session host:
   --guest-diagnostics
 ```
 
+View all options:
+
+```bash
+./avd-doctor.sh --help
+```
+
 ## Permissions
 
 - **Reader** on the AVD and monitoring resources.
 - A custom role containing `Microsoft.Compute/virtualMachines/runCommand/action`
-  when guest diagnostics are enabled.
+  when guest diagnostics are enabled. Scope it to the narrowest required VM or
+  resource group.
 - `AuditLog.Read.All` or an equivalent Entra directory role only when sign-in
   diagnostics are requested with `--upn`.
 
@@ -55,3 +67,8 @@ To include guest-side checks on a selected session host:
 The JSON report is saved under `$HOME` with file permissions set to `600`.
 Reports contain sensitive Azure environment metadata and should be handled
 securely.
+
+## Support
+
+Open a GitHub issue for bugs and feature requests. For security vulnerabilities,
+follow [SECURITY.md](SECURITY.md).
