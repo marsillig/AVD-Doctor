@@ -1,0 +1,780 @@
+#!/usr/bin/env bash
+#
+# AVD Doctor - read-only Azure Virtual Desktop diagnostic collector for Azure Cloud Shell.
+#
+# Required Azure permissions vary by enabled checks. At minimum, use Reader on the
+# target resources. Guest diagnostics additionally require VM Run Command permission;
+# Entra sign-in checks require AuditLog.Read.All or an equivalent directory role.
+
+set -Eeuo pipefail
+# Prevent inherited xtrace from logging UPNs or Azure resource identifiers and
+# ensure reports and temporary files are private from the moment they are created.
+set +x
+umask 077
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly API_VERSION="2024-04-03"
+readonly GRAPH_URL="https://graph.microsoft.com/v1.0"
+readonly LOOKBACK_HOURS=24
+
+SUBSCRIPTION_ID=""
+RESOURCE_GROUP=""
+HOST_POOL=""
+UPN=""
+SESSION_HOST=""
+GUEST_DIAGNOSTICS=false
+NO_COLOR="${NO_COLOR:-}"
+
+TMP_DIR=""
+REPORT_FILE=""
+HOST_POOL_ID=""
+RESOURCE_GROUP_ID=""
+SELECTED_VM_ID=""
+SELECTED_VM_NAME=""
+SELECTED_VM_RG=""
+WORKSPACE_RESOURCE_ID=""
+WORKSPACE_CUSTOMER_ID=""
+
+declare -a FINDINGS=()
+
+usage() {
+  cat <<EOF
+Usage: ${SCRIPT_NAME} --resource-group <name> --host-pool <name> [options]
+
+Required:
+  -rg, --resource-group <name>    Resource group containing the AVD host pool
+  -hp, --host-pool <name>        AVD host pool name
+
+Optional:
+  -s,  --subscription-id <id>    Subscription ID or name (defaults to active)
+  -u,  --upn <user@domain>       Test user UPN for connection/sign-in tracing
+  -sh, --session-host <name>     Session host FQDN or VM name
+       --guest-diagnostics       Opt in to VM Run Command guest diagnostics
+  -h,  --help                    Show this help
+
+Control-plane checks are read-only. The optional --guest-diagnostics flag uses
+Azure VM Run Command to execute diagnostic PowerShell inside one session host.
+No remediation or configuration changes are performed.
+EOF
+}
+
+color() {
+  local code="$1"
+  if [[ -z "$NO_COLOR" && -t 1 ]]; then
+    printf '\033[%sm' "$code"
+  fi
+}
+
+reset_color() { color "0"; }
+
+log() {
+  local level="$1"
+  shift
+  local code="36"
+  case "$level" in
+    PASS) code="32" ;;
+    WARN) code="33" ;;
+    FAIL) code="31" ;;
+    INFO) code="36" ;;
+  esac
+  color "$code"
+  printf '[%s]' "$level"
+  reset_color
+  printf ' %s\n' "$*"
+}
+
+add_finding() {
+  local phase="$1" status="$2" check="$3" message="$4"
+  FINDINGS+=("$(jq -cn \
+    --arg phase "$phase" \
+    --arg status "$status" \
+    --arg check "$check" \
+    --arg message "$message" \
+    '{phase:$phase,status:$status,check:$check,message:$message}')")
+  log "$status" "$message"
+}
+
+die() {
+  log FAIL "$*"
+  exit 1
+}
+
+cleanup() {
+  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+  return 0
+}
+trap cleanup EXIT
+
+on_error() {
+  local exit_code=$?
+  log FAIL "Unexpected error at line ${BASH_LINENO[0]} (exit ${exit_code})."
+  exit "$exit_code"
+}
+trap on_error ERR
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+lowercase() {
+  tr '[:upper:]' '[:lower:]' <<<"$1"
+}
+
+capture_az() {
+  local output_file="$1"
+  local error_file="$2"
+  shift 2
+  if az "$@" --only-show-errors --output json >"$output_file" 2>"$error_file"; then
+    return 0
+  fi
+  return 1
+}
+
+safe_error() {
+  local file="$1"
+  # Avoid copying tokens, credentials, UPNs, GUIDs, or verbose client data into
+  # terminal findings and reports.
+  sed -E \
+    -e 's/(Bearer|token|secret|password|sig|signature)[[:space:]]*[:=]?[[:space:]]*[^[:space:],;}]+/[REDACTED]/Ig' \
+    -e 's/[[:alnum:]_+\/=-]{40,}/[REDACTED_VALUE]/g' \
+    -e 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/[REDACTED_EMAIL]/g' \
+    -e 's/[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}/[REDACTED_ID]/g' \
+    -e 's/[[:space:]]+/ /g' \
+    "$file" | cut -c1-500
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      -s|--subscription-id)
+        (($# >= 2)) || die "Missing value for $1"
+        SUBSCRIPTION_ID="$2"
+        shift 2
+        ;;
+      -rg|--resource-group)
+        (($# >= 2)) || die "Missing value for $1"
+        RESOURCE_GROUP="$2"
+        shift 2
+        ;;
+      -hp|--host-pool)
+        (($# >= 2)) || die "Missing value for $1"
+        HOST_POOL="$2"
+        shift 2
+        ;;
+      -u|--upn)
+        (($# >= 2)) || die "Missing value for $1"
+        UPN="$2"
+        shift 2
+        ;;
+      -sh|--session-host)
+        (($# >= 2)) || die "Missing value for $1"
+        SESSION_HOST="$2"
+        shift 2
+        ;;
+      --guest-diagnostics)
+        GUEST_DIAGNOSTICS=true
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$RESOURCE_GROUP" ]] || die "--resource-group is required"
+  [[ -n "$HOST_POOL" ]] || die "--host-pool is required"
+}
+
+initialize() {
+  require_command az
+  require_command jq
+
+  TMP_DIR="$(mktemp -d)"
+  local timestamp
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  REPORT_FILE="${HOME}/avd-diagnostics-${HOST_POOL//[^A-Za-z0-9_.-]/_}-${timestamp}.json"
+
+  if ! az account show --only-show-errors --output none 2>"$TMP_DIR/account.err"; then
+    die "Azure CLI is not authenticated. Run 'az login' or use an authenticated Cloud Shell."
+  fi
+
+  if [[ -n "$SUBSCRIPTION_ID" ]]; then
+    SUBSCRIPTION_ID="$(az account show \
+      --subscription "$SUBSCRIPTION_ID" \
+      --query id \
+      --output tsv \
+      --only-show-errors \
+      2>"$TMP_DIR/subscription.err")" ||
+      die "Unable to resolve subscription: $(safe_error "$TMP_DIR/subscription.err")"
+  else
+    SUBSCRIPTION_ID="$(az account show --query id --output tsv --only-show-errors)"
+  fi
+
+  RESOURCE_GROUP_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
+
+  add_finding "prerequisites" "PASS" "azure-auth" \
+    "Authenticated to Azure and selected the requested subscription context."
+}
+
+control_plane_audit() {
+  log INFO "Phase 1/4: Control-plane audit"
+
+  HOST_POOL_ID="${RESOURCE_GROUP_ID}/providers/Microsoft.DesktopVirtualization/hostPools/${HOST_POOL}"
+  if ! capture_az "$TMP_DIR/hostpool-raw.json" "$TMP_DIR/hostpool.err" \
+    rest --method GET \
+    --url "https://management.azure.com${HOST_POOL_ID}?api-version=${API_VERSION}"; then
+    die "Host pool not found or inaccessible: $(safe_error "$TMP_DIR/hostpool.err")"
+  fi
+
+  jq '{id,name,location} + .properties' "$TMP_DIR/hostpool-raw.json" >"$TMP_DIR/hostpool.json"
+  HOST_POOL_ID="$(jq -r '.id' "$TMP_DIR/hostpool.json")"
+  add_finding "control-plane" "PASS" "host-pool" \
+    "Resolved host pool ${HOST_POOL}."
+
+  local rdp_properties
+  rdp_properties="$(jq -r '.customRdpProperty // ""' "$TMP_DIR/hostpool.json")"
+  if grep -Eqi '(^|;)targetisaadjoined:i:1(;|$)' <<<"$rdp_properties"; then
+    add_finding "control-plane" "PASS" "target-is-aad-joined" \
+      "Host pool RDP properties include targetisaadjoined:i:1."
+  else
+    add_finding "control-plane" "WARN" "target-is-aad-joined" \
+      "Host pool RDP properties do not include targetisaadjoined:i:1; verify this if hosts are Entra joined."
+  fi
+
+  if capture_az "$TMP_DIR/sessionhosts-raw.json" "$TMP_DIR/sessionhosts.err" \
+    rest --method GET \
+    --url "https://management.azure.com${HOST_POOL_ID}/sessionHosts?api-version=${API_VERSION}"; then
+    jq '[.value[]? | {id,name} + .properties]' \
+      "$TMP_DIR/sessionhosts-raw.json" >"$TMP_DIR/sessionhosts.json"
+    local host_count unhealthy_count
+    host_count="$(jq 'length' "$TMP_DIR/sessionhosts.json")"
+    unhealthy_count="$(jq '[.[] | select((.status // "") != "Available")] | length' "$TMP_DIR/sessionhosts.json")"
+    if ((host_count == 0)); then
+      add_finding "control-plane" "FAIL" "session-hosts" \
+        "Host pool contains no session hosts."
+    elif ((unhealthy_count > 0)); then
+      add_finding "control-plane" "WARN" "session-hosts" \
+        "${host_count} session host(s) found; ${unhealthy_count} are not Available."
+    else
+      add_finding "control-plane" "PASS" "session-hosts" \
+        "${host_count} session host(s) found and all report Available."
+    fi
+
+    local failed_health_checks
+    failed_health_checks="$(jq '[
+      .[].sessionHostHealthCheckResults[]?
+      | select((.healthCheckResult // "") != "HealthCheckSucceeded")
+    ] | length' "$TMP_DIR/sessionhosts.json")"
+    if ((failed_health_checks > 0)); then
+      add_finding "control-plane" "WARN" "session-host-health-checks" \
+        "Session hosts report ${failed_health_checks} non-successful health check(s)."
+    else
+      add_finding "control-plane" "PASS" "session-host-health-checks" \
+        "No failed session-host health checks were returned."
+    fi
+  else
+    printf '[]' >"$TMP_DIR/sessionhosts.json"
+    add_finding "control-plane" "WARN" "session-hosts" \
+      "Unable to list session hosts: $(safe_error "$TMP_DIR/sessionhosts.err")"
+  fi
+
+  audit_workspace_association
+  audit_rbac
+  select_session_host
+}
+
+audit_workspace_association() {
+  if ! capture_az "$TMP_DIR/appgroups.json" "$TMP_DIR/appgroups.err" \
+    resource list \
+    --subscription "$SUBSCRIPTION_ID" \
+    --resource-type Microsoft.DesktopVirtualization/applicationGroups; then
+    printf '[]' >"$TMP_DIR/appgroups.json"
+    add_finding "control-plane" "WARN" "workspace-association" \
+      "Unable to list AVD application groups."
+    return
+  fi
+
+  jq --arg hp "$(lowercase "$HOST_POOL_ID")" \
+    '[.[] | select((.properties.hostPoolArmPath // "" | ascii_downcase) == $hp)]' \
+    "$TMP_DIR/appgroups.json" >"$TMP_DIR/hostpool-appgroups.json"
+
+  capture_az "$TMP_DIR/workspaces.json" "$TMP_DIR/workspaces.err" \
+    resource list \
+    --subscription "$SUBSCRIPTION_ID" \
+    --resource-type Microsoft.DesktopVirtualization/workspaces || printf '[]' >"$TMP_DIR/workspaces.json"
+
+  local association_count
+  association_count="$(jq -n \
+    --slurpfile ag "$TMP_DIR/hostpool-appgroups.json" \
+    --slurpfile ws "$TMP_DIR/workspaces.json" '
+      [$ag[0][].id | ascii_downcase] as $ids
+      | [$ws[0][] | select(
+          [.properties.applicationGroupReferences[]? | ascii_downcase] as $refs
+          | any($refs[]?; . as $r | $ids | index($r))
+        )] | length
+    ')"
+
+  if ((association_count > 0)); then
+    add_finding "control-plane" "PASS" "workspace-association" \
+      "Host pool application group(s) are associated with ${association_count} workspace(s)."
+  else
+    add_finding "control-plane" "FAIL" "workspace-association" \
+      "No workspace association was found for this host pool's application groups."
+  fi
+}
+
+audit_rbac() {
+  if ! capture_az "$TMP_DIR/roles.json" "$TMP_DIR/roles.err" \
+    role assignment list \
+    --subscription "$SUBSCRIPTION_ID" \
+    --scope "$RESOURCE_GROUP_ID" \
+    --include-inherited \
+    --all; then
+    printf '[]' >"$TMP_DIR/roles.json"
+    add_finding "control-plane" "WARN" "vm-login-rbac" \
+      "Unable to inspect inherited VM login role assignments."
+    return
+  fi
+
+  local user_roles admin_roles
+  user_roles="$(jq '[.[] | select(.roleDefinitionName == "Virtual Machine User Login")] | length' "$TMP_DIR/roles.json")"
+  admin_roles="$(jq '[.[] | select(.roleDefinitionName == "Virtual Machine Administrator Login")] | length' "$TMP_DIR/roles.json")"
+
+  if ((user_roles > 0)); then
+    add_finding "control-plane" "PASS" "vm-user-login-rbac" \
+      "Found ${user_roles} inherited Virtual Machine User Login assignment(s)."
+  else
+    add_finding "control-plane" "WARN" "vm-user-login-rbac" \
+      "No inherited Virtual Machine User Login assignment was found at the host pool resource-group scope."
+  fi
+
+  if ((admin_roles > 0)); then
+    add_finding "control-plane" "PASS" "vm-admin-login-rbac" \
+      "Found ${admin_roles} inherited Virtual Machine Administrator Login assignment(s)."
+  else
+    add_finding "control-plane" "INFO" "vm-admin-login-rbac" \
+      "No inherited Virtual Machine Administrator Login assignment was found; this is normal if not required."
+  fi
+}
+
+select_session_host() {
+  local selected_host_json=""
+  if [[ -n "$SESSION_HOST" ]]; then
+    selected_host_json="$(jq -c --arg requested "$(lowercase "$SESSION_HOST")" '
+      [.[] | select(
+        ((.name // "" | split("/")[-1] | ascii_downcase) == $requested)
+        or ((.name // "" | split("/")[-1] | split(".")[0] | ascii_downcase) == ($requested | split(".")[0]))
+      )][0] // empty
+    ' "$TMP_DIR/sessionhosts.json")"
+  else
+    selected_host_json="$(jq -c '
+      ([.[] | select((.status // "") == "Available")][0] // .[0]) // empty
+    ' "$TMP_DIR/sessionhosts.json")"
+  fi
+
+  if [[ -z "$selected_host_json" ]]; then
+    add_finding "control-plane" "WARN" "session-host-selection" \
+      "No session host could be selected for guest diagnostics."
+    return
+  fi
+
+  local avd_host_name
+  avd_host_name="$(jq -r '.name | split("/")[-1]' <<<"$selected_host_json")"
+  SELECTED_VM_ID="$(jq -r '.resourceId // empty' <<<"$selected_host_json")"
+
+  if [[ -z "$SELECTED_VM_ID" ]]; then
+    local short_name
+    short_name="${avd_host_name%%.*}"
+    if capture_az "$TMP_DIR/vm-match.json" "$TMP_DIR/vm-match.err" \
+      vm list --subscription "$SUBSCRIPTION_ID" \
+      --query "[?tolower(name)=='$(lowercase "$short_name")'] | [0]"; then
+      SELECTED_VM_ID="$(jq -r '.id // empty' "$TMP_DIR/vm-match.json")"
+    fi
+  fi
+
+  if [[ -z "$SELECTED_VM_ID" ]]; then
+    add_finding "control-plane" "WARN" "session-host-selection" \
+      "Selected AVD host ${avd_host_name}, but its Azure VM resource could not be resolved."
+    return
+  fi
+
+  SELECTED_VM_NAME="$(awk -F/ '{print $NF}' <<<"$SELECTED_VM_ID")"
+  SELECTED_VM_RG="$(awk -F/ '{for (i=1;i<=NF;i++) if (tolower($i)=="resourcegroups") print $(i+1)}' <<<"$SELECTED_VM_ID")"
+  add_finding "control-plane" "PASS" "session-host-selection" \
+    "Selected session host VM ${SELECTED_VM_NAME} for guest diagnostics."
+}
+
+log_analytics_audit() {
+  log INFO "Phase 2/4: Azure Monitor and Log Analytics"
+
+  if ! capture_az "$TMP_DIR/diagnostic-settings.json" "$TMP_DIR/diagnostic-settings.err" \
+    monitor diagnostic-settings list \
+    --subscription "$SUBSCRIPTION_ID" \
+    --resource "$HOST_POOL_ID"; then
+    printf '{"value":[]}' >"$TMP_DIR/diagnostic-settings.json"
+    add_finding "monitoring" "WARN" "diagnostic-settings" \
+      "Unable to inspect host pool diagnostic settings."
+    return
+  fi
+
+  WORKSPACE_RESOURCE_ID="$(jq -r '
+    [.value[]? | .workspaceId // empty][0] // empty
+  ' "$TMP_DIR/diagnostic-settings.json")"
+
+  if [[ -z "$WORKSPACE_RESOURCE_ID" ]]; then
+    add_finding "monitoring" "WARN" "diagnostic-settings" \
+      "No Log Analytics workspace is configured in the host pool diagnostic settings."
+    return
+  fi
+
+  add_finding "monitoring" "PASS" "diagnostic-settings" \
+    "A Log Analytics destination is configured for the host pool."
+
+  if ! capture_az "$TMP_DIR/workspace.json" "$TMP_DIR/workspace.err" \
+    monitor log-analytics workspace show --ids "$WORKSPACE_RESOURCE_ID"; then
+    add_finding "monitoring" "WARN" "log-analytics-query" \
+      "Unable to resolve the configured Log Analytics workspace."
+    return
+  fi
+  WORKSPACE_CUSTOMER_ID="$(jq -r '.customerId // empty' "$TMP_DIR/workspace.json")"
+
+  run_kql_query "connection-summary" '
+WVDConnections
+| where TimeGenerated > ago(24h)
+| summarize Attempts=count(), Users=dcount(UserName), Hosts=dcount(SessionHostName) by State
+| order by Attempts desc
+'
+
+  run_kql_query "error-summary" '
+WVDErrors
+| where TimeGenerated > ago(24h)
+| summarize Count=count(), Users=dcount(UserName), Hosts=dcount(SessionHostName) by CodeSymbolic, ServiceError
+| top 25 by Count desc
+'
+
+  if [[ -n "$UPN" ]]; then
+    local escaped_upn="${UPN//\'/\'\'}"
+    run_kql_query "user-connection-flow" "
+WVDConnections
+| where TimeGenerated > ago(24h)
+| where UserName =~ '${escaped_upn}'
+| project TimeGenerated, State, SessionHostName, CorrelationId
+| order by TimeGenerated desc
+| take 100
+"
+  fi
+}
+
+run_kql_query() {
+  local name="$1" query="$2"
+  if capture_az "$TMP_DIR/kql-${name}.json" "$TMP_DIR/kql-${name}.err" \
+    monitor log-analytics query \
+    --subscription "$SUBSCRIPTION_ID" \
+    --workspace "$WORKSPACE_CUSTOMER_ID" \
+    --timespan "P1D" \
+    --analytics-query "$query"; then
+    add_finding "monitoring" "PASS" "$name" \
+      "Log Analytics query '${name}' completed."
+  else
+    printf '[]' >"$TMP_DIR/kql-${name}.json"
+    add_finding "monitoring" "WARN" "$name" \
+      "Log Analytics query '${name}' failed or its table is unavailable: $(safe_error "$TMP_DIR/kql-${name}.err")"
+  fi
+}
+
+entra_signin_audit() {
+  log INFO "Phase 3/4: Entra sign-in audit"
+  if [[ -z "$UPN" ]]; then
+    add_finding "identity" "INFO" "entra-signins" \
+      "UPN not supplied; skipped user-specific Entra sign-in audit."
+    printf '[]' >"$TMP_DIR/entra-signins.json"
+    return
+  fi
+
+  local since filter encoded_filter url
+  since="$(date -u -v-"${LOOKBACK_HOURS}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "${LOOKBACK_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
+  filter="userPrincipalName eq '${UPN//\'/\'\'}' and createdDateTime ge ${since}"
+  encoded_filter="$(jq -rn --arg value "$filter" '$value | @uri')"
+  url="${GRAPH_URL}/auditLogs/signIns?\$filter=${encoded_filter}&\$top=100&\$select=createdDateTime,appId,appDisplayName,resourceDisplayName,status,conditionalAccessStatus,isInteractive"
+
+  if capture_az "$TMP_DIR/entra-signins-raw.json" "$TMP_DIR/entra-signins.err" \
+    rest --method GET --url "$url"; then
+    jq '[
+      .value[]? | {
+        createdDateTime,
+        appId,
+        appDisplayName,
+        resourceDisplayName,
+        conditionalAccessStatus,
+        isInteractive,
+        status: {
+          errorCode: (.status.errorCode // 0),
+          failureReason: (.status.failureReason // null),
+          additionalDetails: (.status.additionalDetails // null)
+        }
+      }
+    ]' "$TMP_DIR/entra-signins-raw.json" >"$TMP_DIR/entra-signins.json"
+    rm -f "$TMP_DIR/entra-signins-raw.json"
+
+    local signin_count failure_count ca_failures
+    signin_count="$(jq 'length' "$TMP_DIR/entra-signins.json")"
+    failure_count="$(jq '[.[] | select((.status.errorCode // 0) != 0)] | length' "$TMP_DIR/entra-signins.json")"
+    ca_failures="$(jq '[.[] | select(.conditionalAccessStatus == "failure")] | length' "$TMP_DIR/entra-signins.json")"
+    if ((signin_count == 0)); then
+      add_finding "identity" "WARN" "entra-signins" \
+        "No Entra sign-ins were returned for the supplied UPN in the last ${LOOKBACK_HOURS} hours."
+    elif ((failure_count > 0 || ca_failures > 0)); then
+      add_finding "identity" "WARN" "entra-signins" \
+        "Found ${signin_count} sign-in(s), including ${failure_count} failure(s) and ${ca_failures} Conditional Access failure(s)."
+    else
+      add_finding "identity" "PASS" "entra-signins" \
+        "Found ${signin_count} sign-in(s) with no returned failures."
+    fi
+  else
+    printf '[]' >"$TMP_DIR/entra-signins.json"
+    add_finding "identity" "WARN" "entra-signins" \
+      "Unable to query Entra sign-in logs; AuditLog.Read.All or an equivalent role may be required."
+  fi
+}
+
+guest_diagnostics() {
+  log INFO "Phase 4/4: Session host guest diagnostics"
+  if [[ "$GUEST_DIAGNOSTICS" != true ]]; then
+    add_finding "guest" "INFO" "run-command" \
+      "Guest diagnostics were not requested; skipped VM Run Command."
+    printf '{}' >"$TMP_DIR/run-command.json"
+    return
+  fi
+
+  if [[ -z "$SELECTED_VM_ID" ]]; then
+    add_finding "guest" "WARN" "run-command" \
+      "Skipped guest diagnostics because no session host VM was resolved."
+    printf '{}' >"$TMP_DIR/run-command.json"
+    return
+  fi
+
+  local guest_script
+  guest_script="$(cat <<'POWERSHELL'
+$ErrorActionPreference = 'Stop'
+$result = [ordered]@{
+    ComputerName = $env:COMPUTERNAME
+    TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Checks = @()
+}
+
+function Add-Check {
+    param([string]$Name, [string]$Status, [string]$Message, [object]$Data = $null)
+    $result.Checks += [ordered]@{ Name = $Name; Status = $Status; Message = $Message; Data = $Data }
+}
+
+try {
+    $services = Get-Service -Name RDAgentBootLoader, frxsvc, frxccd -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType
+    $rdAgent = $services | Where-Object Name -eq 'RDAgentBootLoader'
+    Add-Check 'AVD agent service' $(if ($rdAgent.Status -eq 'Running') {'PASS'} else {'FAIL'}) "RDAgentBootLoader status: $($rdAgent.Status)" $services
+} catch { Add-Check 'AVD agent service' 'WARN' $_.Exception.Message }
+
+try {
+    $agentUrlTool = Get-ChildItem 'C:\Program Files\Microsoft RDInfra' -Filter 'WVDAgentUrlTool.exe' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($agentUrlTool) {
+        $urlToolOutput = & $agentUrlTool.FullName 2>&1 | Out-String
+        $urlToolExitCode = $LASTEXITCODE
+        Add-Check 'AVD required endpoints' $(if ($urlToolExitCode -eq 0) {'PASS'} else {'FAIL'}) "WVDAgentUrlTool exited with code $urlToolExitCode." ([ordered]@{ ToolFound = $true; ExitCode = $urlToolExitCode })
+    } else {
+        $endpoints = @('rdbroker.wvd.microsoft.com', 'mrsglobalsteptomwsprod.blob.core.windows.net')
+        $tests = foreach ($endpoint in $endpoints) {
+            $test = Test-NetConnection -ComputerName $endpoint -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+            [ordered]@{ Port = 443; Reachable = [bool]$test }
+        }
+        $failed = @($tests | Where-Object Reachable -eq $false).Count
+        Add-Check 'AVD required endpoints' $(if ($failed -eq 0) {'WARN'} else {'FAIL'}) "WVDAgentUrlTool was not found; fallback endpoint tests failed: $failed of $($tests.Count)." ([ordered]@{ ToolFound = $false; Tests = $tests })
+    }
+} catch { Add-Check 'AVD required endpoints' 'WARN' $_.Exception.Message }
+
+try {
+    $profileKey = 'HKLM:\SOFTWARE\FSLogix\Profiles'
+    $profile = if (Test-Path $profileKey) { Get-ItemProperty $profileKey } else { $null }
+    $locations = @($profile.VHDLocations) + @($profile.CCDLocations) | Where-Object { $_ }
+    $targets = foreach ($location in $locations) {
+        if ($location -match '^\\\\([^\\]+)\\') {
+            [ordered]@{
+                Smb445Reachable = [bool](Test-NetConnection -ComputerName $Matches[1] -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue)
+            }
+        }
+    }
+    $fslogixServices = Get-Service -Name frxsvc, frxccd -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType
+    $enabled = $profile -and $profile.Enabled -eq 1
+    $unreachable = @($targets | Where-Object Smb445Reachable -eq $false).Count
+    Add-Check 'FSLogix configuration' $(if ($enabled -and $unreachable -eq 0) {'PASS'} elseif ($profile) {'WARN'} else {'INFO'}) "Enabled=$enabled; configured locations=$($locations.Count); unreachable SMB targets=$unreachable." ([ordered]@{ Enabled = $enabled; Locations = $targets; Services = $fslogixServices })
+} catch { Add-Check 'FSLogix configuration' 'WARN' $_.Exception.Message }
+
+try {
+    $logRoot = 'C:\ProgramData\FSLogix\Logs\Profiles'
+    $matches = if (Test-Path $logRoot) {
+        Get-ChildItem $logRoot -Filter '*.log' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 3 |
+            ForEach-Object { Select-String -Path $_.FullName -Pattern 'error|warn|failed|denied' | Select-Object -Last 10 }
+    }
+    Add-Check 'FSLogix recent logs' $(if (@($matches).Count -gt 0) {'WARN'} else {'PASS'}) "Found $(@($matches).Count) recent error/warning line(s)." ([ordered]@{ MatchCount = @($matches).Count })
+} catch { Add-Check 'FSLogix recent logs' 'WARN' $_.Exception.Message }
+
+try {
+    $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $freePercent = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
+    Add-Check 'System disk free space' $(if ($freePercent -gt 10) {'PASS'} else {'FAIL'}) "C: has $freePercent% free space." ([ordered]@{ FreePercent = $freePercent })
+} catch { Add-Check 'System disk free space' 'WARN' $_.Exception.Message }
+
+try {
+    $license = Get-CimInstance SoftwareLicensingProduct |
+        Where-Object { $_.PartialProductKey -and $_.Name -like 'Windows*' } |
+        Select-Object -First 1 Name, LicenseStatus, Description
+    Add-Check 'Windows activation' $(if ($license.LicenseStatus -eq 1) {'PASS'} else {'FAIL'}) "Windows LicenseStatus=$($license.LicenseStatus)." $license
+} catch { Add-Check 'Windows activation' 'WARN' $_.Exception.Message }
+
+try {
+    $headers = @{ Metadata = 'true' }
+    $imdsResponse = Invoke-WebRequest -UseBasicParsing -Headers $headers -Method Get -Uri 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
+    $imds = $imdsResponse.Content | ConvertFrom-Json
+    $localUtc = (Get-Date).ToUniversalTime()
+    $azureUtc = [datetime]::Parse($imdsResponse.Headers.Date).ToUniversalTime()
+    $skewSeconds = [math]::Abs(($localUtc - $azureUtc).TotalSeconds)
+    $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+    $timeSource = (w32tm /query /source 2>$null | Out-String).Trim()
+    $timeStatus = (w32tm /query /status 2>$null | Out-String).Trim()
+    Add-Check 'Clock synchronization' $(if ($skewSeconds -le 300) {'PASS'} else {'FAIL'}) "Clock skew versus the Azure IMDS HTTP date is $([math]::Round($skewSeconds, 1)) seconds." ([ordered]@{ TimeSourceConfigured = [bool]$timeSource; LastBootUtc = $bootTime.ToString('o'); SkewSeconds = $skewSeconds; W32TimeStatusAvailable = [bool]$timeStatus })
+} catch { Add-Check 'Clock synchronization' 'WARN' $_.Exception.Message }
+
+$json = $result | ConvertTo-Json -Depth 8 -Compress
+Write-Output "AVD_DOCTOR_JSON=$json"
+POWERSHELL
+)"
+
+  if capture_az "$TMP_DIR/run-command.json" "$TMP_DIR/run-command.err" \
+    vm run-command invoke \
+    --subscription "$SUBSCRIPTION_ID" \
+    --resource-group "$SELECTED_VM_RG" \
+    --name "$SELECTED_VM_NAME" \
+    --command-id RunPowerShellScript \
+    --scripts "$guest_script"; then
+    local guest_json
+    guest_json="$(jq -r '
+      [.value[]?.message // empty]
+      | join("\n")
+      | split("AVD_DOCTOR_JSON=")[1] // empty
+      | split("\n")[0]
+    ' "$TMP_DIR/run-command.json")"
+    if jq -e . >/dev/null 2>&1 <<<"$guest_json"; then
+      jq . <<<"$guest_json" >"$TMP_DIR/guest-diagnostics.json"
+      add_finding "guest" "PASS" "run-command" \
+        "Guest diagnostics completed on ${SELECTED_VM_NAME}."
+    else
+      printf '{}' >"$TMP_DIR/guest-diagnostics.json"
+      add_finding "guest" "WARN" "run-command" \
+        "Run Command completed, but its structured diagnostic output could not be parsed."
+    fi
+  else
+    printf '{}' >"$TMP_DIR/run-command.json"
+    printf '{}' >"$TMP_DIR/guest-diagnostics.json"
+    add_finding "guest" "WARN" "run-command" \
+      "Unable to run guest diagnostics: $(safe_error "$TMP_DIR/run-command.err")"
+  fi
+}
+
+write_report() {
+  local findings_file="$TMP_DIR/findings.jsonl"
+  printf '%s\n' "${FINDINGS[@]}" >"$findings_file"
+
+  local sanitized_hosts="$TMP_DIR/sessionhosts-sanitized.json"
+  jq '[.[] | {
+    name: (.name | split("/")[-1]),
+    status,
+    allowNewSession,
+    agentVersion,
+    lastHeartBeat,
+    updateState,
+    sessions,
+    healthCheckResults: [.sessionHostHealthCheckResults[]? | {
+      healthCheckName,
+      healthCheckResult,
+      additionalFailureDetails
+    }]
+  }]' "$TMP_DIR/sessionhosts.json" >"$sanitized_hosts"
+
+  jq -n \
+    --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg subscriptionId "$SUBSCRIPTION_ID" \
+    --arg resourceGroup "$RESOURCE_GROUP" \
+    --arg hostPool "$HOST_POOL" \
+    --arg selectedVm "$SELECTED_VM_NAME" \
+    --arg workspaceId "$WORKSPACE_RESOURCE_ID" \
+    --slurpfile findings "$findings_file" \
+    --slurpfile hostPoolData "$TMP_DIR/hostpool.json" \
+    --slurpfile sessionHosts "$sanitized_hosts" \
+    --slurpfile connectionSummary "${TMP_DIR}/kql-connection-summary.json" \
+    --slurpfile errorSummary "${TMP_DIR}/kql-error-summary.json" \
+    --slurpfile userFlow "${TMP_DIR}/kql-user-connection-flow.json" \
+    --slurpfile signIns "$TMP_DIR/entra-signins.json" \
+    --slurpfile guest "$TMP_DIR/guest-diagnostics.json" '
+      {
+        schemaVersion: "1.0",
+        generatedAtUtc: $generatedAt,
+        scope: {
+          subscriptionId: $subscriptionId,
+          resourceGroup: $resourceGroup,
+          hostPool: $hostPool,
+          selectedVm: ($selectedVm | select(length > 0)),
+          logAnalyticsWorkspaceResourceId: ($workspaceId | select(length > 0))
+        },
+        findings: $findings,
+        controlPlane: {
+          hostPool: ($hostPoolData[0] | {
+            name, location, hostPoolType, loadBalancerType, maxSessionLimit,
+            preferredAppGroupType, startVMOnConnect, validationEnvironment,
+            rdpPropertyChecks: {
+              targetIsAadJoined: ((.customRdpProperty // "") | test("(^|;)targetisaadjoined:i:1(;|$)"; "i")),
+              enableRdsAadAuth: ((.customRdpProperty // "") | test("(^|;)enablerdsaadauth:i:1(;|$)"; "i"))
+            }
+          }),
+          sessionHosts: $sessionHosts[0]
+        },
+        monitoring: {
+          connectionSummary: ($connectionSummary[0] // []),
+          errorSummary: ($errorSummary[0] // []),
+          userConnectionFlow: ($userFlow[0] // [])
+        },
+        identity: {
+          signIns: ($signIns[0] // [])
+        },
+        guest: ($guest[0] // {})
+      }
+    ' >"$REPORT_FILE"
+
+  chmod 600 "$REPORT_FILE"
+  jq empty "$REPORT_FILE"
+  log PASS "Diagnostic JSON report written to ${REPORT_FILE}"
+}
+
+main() {
+  parse_args "$@"
+  initialize
+
+  # Ensure optional report fragments always exist.
+  printf '[]' >"$TMP_DIR/kql-connection-summary.json"
+  printf '[]' >"$TMP_DIR/kql-error-summary.json"
+  printf '[]' >"$TMP_DIR/kql-user-connection-flow.json"
+  printf '[]' >"$TMP_DIR/entra-signins.json"
+  printf '{}' >"$TMP_DIR/guest-diagnostics.json"
+
+  control_plane_audit
+  log_analytics_audit
+  entra_signin_audit
+  guest_diagnostics
+  write_report
+}
+
+main "$@"

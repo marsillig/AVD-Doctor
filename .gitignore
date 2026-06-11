@@ -1,0 +1,32 @@
+# AVD Doctor diagnostic output contains client environment metadata.
+avd-diagnostics-*.json
+avd-diagnostics-*/
+
+# Local environment, credentials, and secret material.
+.env
+.env.*
+!.env.example
+.azure/
+credentials*.json
+secrets*.json
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Logs, transcripts, temporary files, and scanner output.
+*.log
+*.tmp
+*.temp
+*.transcript
+*.sarif
+.avd-doctor-*
+tmp/
+temp/
+security-reports/
+
+# Editor and operating-system artifacts.
+.DS_Store
+.idea/
+.vscode/
+*~
