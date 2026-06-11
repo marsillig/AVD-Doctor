@@ -13,7 +13,7 @@ set +x
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly VERSION="0.1.0"
+readonly VERSION="0.1.1"
 readonly API_VERSION="2024-04-03"
 readonly GRAPH_URL="https://graph.microsoft.com/v1.0"
 readonly LOOKBACK_HOURS=24
@@ -292,29 +292,34 @@ control_plane_audit() {
   fi
 
   audit_workspace_association
-  audit_rbac
   select_session_host
+  audit_rbac
 }
 
 audit_workspace_association() {
-  if ! capture_az "$TMP_DIR/appgroups.json" "$TMP_DIR/appgroups.err" \
-    resource list \
-    --subscription "$SUBSCRIPTION_ID" \
-    --resource-type Microsoft.DesktopVirtualization/applicationGroups; then
+  if ! capture_az "$TMP_DIR/appgroups-raw.json" "$TMP_DIR/appgroups.err" \
+    rest --method GET \
+    --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.DesktopVirtualization/applicationGroups?api-version=${API_VERSION}"; then
     printf '[]' >"$TMP_DIR/appgroups.json"
     add_finding "control-plane" "WARN" "workspace-association" \
       "Unable to list AVD application groups."
     return
   fi
+  jq 'if type == "array" then . else (.value // []) end' \
+    "$TMP_DIR/appgroups-raw.json" >"$TMP_DIR/appgroups.json"
 
   jq --arg hp "$(lowercase "$HOST_POOL_ID")" \
     '[.[] | select((.properties.hostPoolArmPath // "" | ascii_downcase) == $hp)]' \
     "$TMP_DIR/appgroups.json" >"$TMP_DIR/hostpool-appgroups.json"
 
-  capture_az "$TMP_DIR/workspaces.json" "$TMP_DIR/workspaces.err" \
-    resource list \
-    --subscription "$SUBSCRIPTION_ID" \
-    --resource-type Microsoft.DesktopVirtualization/workspaces || printf '[]' >"$TMP_DIR/workspaces.json"
+  if capture_az "$TMP_DIR/workspaces-raw.json" "$TMP_DIR/workspaces.err" \
+    rest --method GET \
+    --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.DesktopVirtualization/workspaces?api-version=${API_VERSION}"; then
+    jq 'if type == "array" then . else (.value // []) end' \
+      "$TMP_DIR/workspaces-raw.json" >"$TMP_DIR/workspaces.json"
+  else
+    printf '[]' >"$TMP_DIR/workspaces.json"
+  fi
 
   local association_count
   association_count="$(jq -n \
@@ -337,15 +342,22 @@ audit_workspace_association() {
 }
 
 audit_rbac() {
+  local rbac_scope="$RESOURCE_GROUP_ID"
+  local scope_description="host pool resource group"
+  if [[ -n "$SELECTED_VM_ID" ]]; then
+    rbac_scope="$SELECTED_VM_ID"
+    scope_description="selected session-host VM and inherited scopes"
+  fi
+
   if ! capture_az "$TMP_DIR/roles.json" "$TMP_DIR/roles.err" \
     role assignment list \
     --subscription "$SUBSCRIPTION_ID" \
-    --scope "$RESOURCE_GROUP_ID" \
+    --scope "$rbac_scope" \
     --include-inherited \
     --all; then
     printf '[]' >"$TMP_DIR/roles.json"
     add_finding "control-plane" "WARN" "vm-login-rbac" \
-      "Unable to inspect inherited VM login role assignments."
+      "Unable to inspect VM login role assignments on the ${scope_description}."
     return
   fi
 
@@ -358,7 +370,7 @@ audit_rbac() {
       "Found ${user_roles} inherited Virtual Machine User Login assignment(s)."
   else
     add_finding "control-plane" "WARN" "vm-user-login-rbac" \
-      "No inherited Virtual Machine User Login assignment was found at the host pool resource-group scope."
+      "No Virtual Machine User Login assignment was found on the ${scope_description}."
   fi
 
   if ((admin_roles > 0)); then
@@ -424,14 +436,15 @@ log_analytics_audit() {
     monitor diagnostic-settings list \
     --subscription "$SUBSCRIPTION_ID" \
     --resource "$HOST_POOL_ID"; then
-    printf '{"value":[]}' >"$TMP_DIR/diagnostic-settings.json"
+    printf '[]' >"$TMP_DIR/diagnostic-settings.json"
     add_finding "monitoring" "WARN" "diagnostic-settings" \
       "Unable to inspect host pool diagnostic settings."
     return
   fi
 
   WORKSPACE_RESOURCE_ID="$(jq -r '
-    [.value[]? | .workspaceId // empty][0] // empty
+    (if type == "array" then . else (.value // []) end)
+    | [.[]? | .workspaceId // empty][0] // empty
   ' "$TMP_DIR/diagnostic-settings.json")"
 
   if [[ -z "$WORKSPACE_RESOURCE_ID" ]]; then
