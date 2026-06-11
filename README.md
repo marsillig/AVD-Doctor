@@ -72,3 +72,7 @@ securely.
 
 Open a GitHub issue for bugs and feature requests. For security vulnerabilities,
 follow [SECURITY.md](SECURITY.md).
+
+## License
+
+Licensed under the [MIT License](LICENSE).
