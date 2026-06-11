@@ -13,7 +13,7 @@ set +x
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly VERSION="0.1.1"
+readonly VERSION="0.1.2"
 readonly API_VERSION="2024-04-03"
 readonly GRAPH_URL="https://graph.microsoft.com/v1.0"
 readonly LOOKBACK_HOURS=24
@@ -426,7 +426,7 @@ select_session_host() {
   SELECTED_VM_NAME="$(awk -F/ '{print $NF}' <<<"$SELECTED_VM_ID")"
   SELECTED_VM_RG="$(awk -F/ '{for (i=1;i<=NF;i++) if (tolower($i)=="resourcegroups") print $(i+1)}' <<<"$SELECTED_VM_ID")"
   add_finding "control-plane" "PASS" "session-host-selection" \
-    "Selected session host VM ${SELECTED_VM_NAME} for guest diagnostics."
+    "Selected session host VM ${SELECTED_VM_NAME} for optional guest diagnostics."
 }
 
 log_analytics_audit() {
@@ -474,7 +474,7 @@ WVDConnections
   run_kql_query "error-summary" '
 WVDErrors
 | where TimeGenerated > ago(24h)
-| summarize Count=count(), Users=dcount(UserName), Hosts=dcount(SessionHostName) by CodeSymbolic, ServiceError
+| summarize Count=count(), Users=dcount(UserName) by CodeSymbolic, ServiceError
 | top 25 by Count desc
 '
 
@@ -499,8 +499,14 @@ run_kql_query() {
     --workspace "$WORKSPACE_CUSTOMER_ID" \
     --timespan "P1D" \
     --analytics-query "$query"; then
-    add_finding "monitoring" "PASS" "$name" \
-      "Log Analytics query '${name}' completed."
+    if jq -e . "$TMP_DIR/kql-${name}.json" >/dev/null 2>&1; then
+      add_finding "monitoring" "PASS" "$name" \
+        "Log Analytics query '${name}' completed."
+    else
+      printf '[]' >"$TMP_DIR/kql-${name}.json"
+      add_finding "monitoring" "WARN" "$name" \
+        "Log Analytics query '${name}' completed but returned non-JSON output; its results were omitted from the report."
+    fi
   else
     printf '[]' >"$TMP_DIR/kql-${name}.json"
     add_finding "monitoring" "WARN" "$name" \

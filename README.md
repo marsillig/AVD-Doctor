@@ -14,7 +14,7 @@ optional session-host checks without applying remediation changes.
 ## Download in Azure Cloud Shell
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.1/avd-doctor.sh
+curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.2/avd-doctor.sh
 chmod +x avd-doctor.sh
 ```
 
