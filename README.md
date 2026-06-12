@@ -4,6 +4,14 @@ AVD Doctor is a portable Azure Virtual Desktop diagnostic collector designed to
 run in Azure Cloud Shell. It performs control-plane, monitoring, identity, and
 optional session-host checks without applying remediation changes.
 
+Identity checks also verify:
+
+- Azure Virtual Desktop, Windows Cloud Login, and Microsoft Remote Desktop
+  enterprise applications are enabled.
+- Microsoft Entra authentication for RDP is enabled on Windows Cloud Login.
+- Conditional Access app-ID inclusions, exclusions, effective policy coverage,
+  and Azure Virtual Desktop/Windows Cloud Login targeting alignment.
+
 ## Requirements
 
 - Azure Cloud Shell using Bash
@@ -14,7 +22,7 @@ optional session-host checks without applying remediation changes.
 ## Download in Azure Cloud Shell
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.3/avd-doctor.sh
+curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.4/avd-doctor.sh
 chmod +x avd-doctor.sh
 ```
 
@@ -67,6 +75,11 @@ View all options:
   session-host resource group.
 - `AuditLog.Read.All` or an equivalent Entra directory role only when sign-in
   diagnostics are requested with `--upn`.
+- `Application.Read.All` and a supported Entra role to verify the Azure Virtual
+  Desktop, Windows Cloud Login, and Microsoft Remote Desktop enterprise
+  applications and the Windows Cloud Login RDP authentication configuration.
+- `Policy.Read.All` and a supported Entra role, such as Security Reader or
+  Global Reader, to verify Conditional Access app inclusions and exclusions.
 
 ## Reports
 

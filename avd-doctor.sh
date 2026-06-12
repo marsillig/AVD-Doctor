@@ -13,10 +13,13 @@ set +x
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly VERSION="0.1.3"
+readonly VERSION="0.1.4"
 readonly API_VERSION="2024-04-03"
 readonly GRAPH_URL="https://graph.microsoft.com/v1.0"
 readonly LOOKBACK_HOURS=24
+readonly AZURE_VIRTUAL_DESKTOP_APP_ID="9cdead84-a844-4324-93f2-b2e6bb768d07"
+readonly WINDOWS_CLOUD_LOGIN_APP_ID="270efc09-cd0d-444b-a71f-39af4910ec45"
+readonly MICROSOFT_REMOTE_DESKTOP_APP_ID="a4a365df-50f1-4397-bc59-1a1564b8bb9c"
 
 SUBSCRIPTION_ID=""
 RESOURCE_GROUP=""
@@ -516,8 +519,183 @@ run_kql_query() {
   fi
 }
 
+check_entra_application() {
+  local name="$1" app_id="$2" check_rdp_protocol="$3"
+  local slug="${name//[^A-Za-z0-9_.-]/_}"
+  local sp_file="$TMP_DIR/entra-app-${slug}.json"
+  local sp_error="$TMP_DIR/entra-app-${slug}.err"
+  local rdp_enabled="null"
+
+  if ! capture_az "$sp_file" "$sp_error" \
+    rest --method GET \
+    --url "${GRAPH_URL}/servicePrincipals(appId='${app_id}')?\$select=id,appId,displayName,accountEnabled"; then
+    add_finding "identity" "WARN" "entra-app-${slug}" \
+      "Unable to inspect the ${name} enterprise application; Application.Read.All or an equivalent role may be required."
+    jq -n \
+      --arg name "$name" \
+      --arg appId "$app_id" \
+      '{name:$name,appId:$appId,queryStatus:"unavailable"}' \
+      >"$TMP_DIR/entra-app-result-${slug}.json"
+    return
+  fi
+
+  local account_enabled sp_id
+  account_enabled="$(jq -r '.accountEnabled // false' "$sp_file")"
+  sp_id="$(jq -r '.id // empty' "$sp_file")"
+  if [[ "$account_enabled" == "true" ]]; then
+    add_finding "identity" "PASS" "entra-app-${slug}" \
+      "${name} enterprise application is enabled."
+  else
+    add_finding "identity" "FAIL" "entra-app-${slug}" \
+      "${name} enterprise application is disabled."
+  fi
+
+  if [[ "$check_rdp_protocol" == "true" && -n "$sp_id" ]]; then
+    if capture_az "$TMP_DIR/entra-rdp-${slug}.json" "$TMP_DIR/entra-rdp-${slug}.err" \
+      rest --method GET \
+      --url "${GRAPH_URL}/servicePrincipals/${sp_id}/remoteDesktopSecurityConfiguration"; then
+      rdp_enabled="$(jq -r '.isRemoteDesktopProtocolEnabled // false' "$TMP_DIR/entra-rdp-${slug}.json")"
+      if [[ "$rdp_enabled" == "true" ]]; then
+        add_finding "identity" "PASS" "entra-rdp-${slug}" \
+          "Microsoft Entra authentication for RDP is enabled on ${name}."
+      else
+        add_finding "identity" "FAIL" "entra-rdp-${slug}" \
+          "Microsoft Entra authentication for RDP is not enabled on ${name}."
+      fi
+    else
+      add_finding "identity" "WARN" "entra-rdp-${slug}" \
+        "Unable to inspect Microsoft Entra authentication for RDP on ${name}; Application.Read.All and a supported Entra role may be required."
+    fi
+  fi
+
+  jq \
+    --arg name "$name" \
+    --arg appId "$app_id" \
+    --argjson remoteDesktopProtocolEnabled "$rdp_enabled" \
+    '{
+      name: $name,
+      appId: $appId,
+      servicePrincipalId: .id,
+      displayName,
+      accountEnabled,
+      remoteDesktopProtocolEnabled: $remoteDesktopProtocolEnabled,
+      queryStatus: "completed"
+    }' "$sp_file" >"$TMP_DIR/entra-app-result-${slug}.json"
+}
+
+entra_application_audit() {
+  log INFO "Phase 3/4: Entra application and Conditional Access audit"
+
+  check_entra_application "Azure Virtual Desktop" "$AZURE_VIRTUAL_DESKTOP_APP_ID" false
+  check_entra_application "Windows Cloud Login" "$WINDOWS_CLOUD_LOGIN_APP_ID" true
+  check_entra_application "Microsoft Remote Desktop" "$MICROSOFT_REMOTE_DESKTOP_APP_ID" false
+
+  jq -s '.' "$TMP_DIR"/entra-app-result-*.json >"$TMP_DIR/entra-applications.json"
+
+  if ! capture_az "$TMP_DIR/conditional-access-raw.json" "$TMP_DIR/conditional-access.err" \
+    rest --method GET \
+    --url "${GRAPH_URL}/identity/conditionalAccess/policies?\$select=id,displayName,state,conditions,grantControls,sessionControls"; then
+    printf '{"queryStatus":"unavailable","policies":[],"applications":[],"applicationFilterPolicies":[]}' \
+      >"$TMP_DIR/conditional-access.json"
+    add_finding "identity" "WARN" "conditional-access-app-targeting" \
+      "Unable to inspect Conditional Access app inclusions and exclusions; Policy.Read.All and a supported Entra role may be required."
+    return
+  fi
+
+  jq \
+    --arg avd "$AZURE_VIRTUAL_DESKTOP_APP_ID" \
+    --arg wcl "$WINDOWS_CLOUD_LOGIN_APP_ID" \
+    --arg msrd "$MICROSOFT_REMOTE_DESKTOP_APP_ID" '
+    def policies:
+      [.value[]? | {
+        id,
+        displayName,
+        state,
+        includeApplications: (.conditions.applications.includeApplications // []),
+        excludeApplications: (.conditions.applications.excludeApplications // []),
+        applicationFilter: (.conditions.applications.applicationFilter // null),
+        hasSignInFrequency: (.sessionControls.signInFrequency.isEnabled // false),
+        grantControls: (.grantControls.builtInControls // [])
+      }];
+    def targets($policies; $id):
+      [$policies[] |
+        select(.state != "disabled") |
+        select(((.includeApplications | index("All")) != null or (.includeApplications | index($id)) != null)
+          and (.excludeApplications | index($id)) == null) |
+        {id,displayName,state,hasSignInFrequency,grantControls}
+      ];
+    def excludes($policies; $id):
+      [$policies[] |
+        select(.state != "disabled") |
+        select((.excludeApplications | index($id)) != null) |
+        {id,displayName,state}
+      ];
+    policies as $policies |
+    {
+      queryStatus: "completed",
+      policies: $policies,
+      applications: [
+        {name:"Azure Virtual Desktop",appId:$avd,effectivePolicies:targets($policies;$avd),explicitExclusions:excludes($policies;$avd)},
+        {name:"Windows Cloud Login",appId:$wcl,effectivePolicies:targets($policies;$wcl),explicitExclusions:excludes($policies;$wcl)},
+        {name:"Microsoft Remote Desktop",appId:$msrd,effectivePolicies:targets($policies;$msrd),explicitExclusions:excludes($policies;$msrd)}
+      ],
+      applicationFilterPolicies: [$policies[] | select(.state != "disabled" and .applicationFilter != null) | {id,displayName,state,applicationFilter}]
+    }' "$TMP_DIR/conditional-access-raw.json" >"$TMP_DIR/conditional-access.json"
+  rm -f "$TMP_DIR/conditional-access-raw.json"
+
+  local policy_count avd_enabled wcl_enabled msrd_enabled avd_excluded wcl_excluded filter_count alignment_gaps
+  policy_count="$(jq '.policies | length' "$TMP_DIR/conditional-access.json")"
+  avd_enabled="$(jq '[.applications[] | select(.appId == "'"$AZURE_VIRTUAL_DESKTOP_APP_ID"'") | .effectivePolicies[] | select(.state == "enabled")] | length' "$TMP_DIR/conditional-access.json")"
+  wcl_enabled="$(jq '[.applications[] | select(.appId == "'"$WINDOWS_CLOUD_LOGIN_APP_ID"'") | .effectivePolicies[] | select(.state == "enabled")] | length' "$TMP_DIR/conditional-access.json")"
+  msrd_enabled="$(jq '[.applications[] | select(.appId == "'"$MICROSOFT_REMOTE_DESKTOP_APP_ID"'") | .effectivePolicies[] | select(.state == "enabled")] | length' "$TMP_DIR/conditional-access.json")"
+  avd_excluded="$(jq '[.applications[] | select(.appId == "'"$AZURE_VIRTUAL_DESKTOP_APP_ID"'") | .explicitExclusions[]] | length' "$TMP_DIR/conditional-access.json")"
+  wcl_excluded="$(jq '[.applications[] | select(.appId == "'"$WINDOWS_CLOUD_LOGIN_APP_ID"'") | .explicitExclusions[]] | length' "$TMP_DIR/conditional-access.json")"
+  filter_count="$(jq '.applicationFilterPolicies | length' "$TMP_DIR/conditional-access.json")"
+  alignment_gaps="$(jq \
+    --arg avd "$AZURE_VIRTUAL_DESKTOP_APP_ID" \
+    --arg wcl "$WINDOWS_CLOUD_LOGIN_APP_ID" '
+    ([.applications[] | select(.appId == $avd) | .effectivePolicies[] | select(.state == "enabled")] // []) as $avdPolicies |
+    ([.applications[] | select(.appId == $wcl) | .effectivePolicies[] | select(.state == "enabled")] // []) as $wclPolicies |
+    (
+      [$avdPolicies[] | select(.id as $id | [$wclPolicies[].id] | index($id) == null)] +
+      [$wclPolicies[] | select(.id as $id | [$avdPolicies[].id] | index($id) == null) | select(.hasSignInFrequency != true)]
+    ) | unique_by(.id) | length
+    ' "$TMP_DIR/conditional-access.json")"
+
+  add_finding "identity" "INFO" "conditional-access-app-targeting" \
+    "Reviewed ${policy_count} Conditional Access policies. Enabled policies targeting Azure Virtual Desktop: ${avd_enabled}; Windows Cloud Login: ${wcl_enabled}; Microsoft Remote Desktop: ${msrd_enabled}. Explicit exclusions for Azure Virtual Desktop: ${avd_excluded}; Windows Cloud Login: ${wcl_excluded}."
+
+  if ((avd_enabled == 0)); then
+    add_finding "identity" "WARN" "conditional-access-avd-coverage" \
+      "No enabled Conditional Access policy targets Azure Virtual Desktop."
+  else
+    add_finding "identity" "PASS" "conditional-access-avd-coverage" \
+      "At least one enabled Conditional Access policy targets Azure Virtual Desktop."
+  fi
+
+  if ((wcl_enabled == 0)); then
+    add_finding "identity" "WARN" "conditional-access-wcl-coverage" \
+      "No enabled Conditional Access policy targets Windows Cloud Login; review SSO authentication policy coverage."
+  else
+    add_finding "identity" "PASS" "conditional-access-wcl-coverage" \
+      "At least one enabled Conditional Access policy targets Windows Cloud Login."
+  fi
+
+  if ((alignment_gaps > 0)); then
+    add_finding "identity" "WARN" "conditional-access-avd-wcl-alignment" \
+      "${alignment_gaps} enabled Conditional Access policy or policies target Azure Virtual Desktop and Windows Cloud Login inconsistently; Windows Cloud Login-only sign-in-frequency policies were excluded from this comparison."
+  else
+    add_finding "identity" "PASS" "conditional-access-avd-wcl-alignment" \
+      "Enabled Conditional Access app targeting is aligned between Azure Virtual Desktop and Windows Cloud Login, excluding Windows Cloud Login-only sign-in-frequency policies."
+  fi
+
+  if ((filter_count > 0)); then
+    add_finding "identity" "WARN" "conditional-access-app-filters" \
+      "${filter_count} active Conditional Access policy or policies use application filters; their dynamic app targeting requires manual review."
+  fi
+}
+
 entra_signin_audit() {
-  log INFO "Phase 3/4: Entra sign-in audit"
   if [[ -z "$UPN" ]]; then
     add_finding "identity" "INFO" "entra-signins" \
       "UPN not supplied; skipped user-specific Entra sign-in audit."
@@ -750,6 +928,8 @@ write_report() {
     --slurpfile errorSummary "${TMP_DIR}/kql-error-summary.json" \
     --slurpfile userFlow "${TMP_DIR}/kql-user-connection-flow.json" \
     --slurpfile signIns "$TMP_DIR/entra-signins.json" \
+    --slurpfile enterpriseApplications "$TMP_DIR/entra-applications.json" \
+    --slurpfile conditionalAccess "$TMP_DIR/conditional-access.json" \
     --slurpfile guest "$TMP_DIR/guest-diagnostics.json" '
       {
         schemaVersion: "1.0",
@@ -759,8 +939,8 @@ write_report() {
           subscriptionId: $subscriptionId,
           resourceGroup: $resourceGroup,
           hostPool: $hostPool,
-          selectedVm: ($selectedVm | select(length > 0)),
-          logAnalyticsWorkspaceResourceId: ($workspaceId | select(length > 0))
+          selectedVm: (if ($selectedVm | length) > 0 then $selectedVm else null end),
+          logAnalyticsWorkspaceResourceId: (if ($workspaceId | length) > 0 then $workspaceId else null end)
         },
         findings: $findings,
         controlPlane: {
@@ -780,14 +960,16 @@ write_report() {
           userConnectionFlow: ($userFlow[0] // [])
         },
         identity: {
-          signIns: ($signIns[0] // [])
+          signIns: ($signIns[0] // []),
+          enterpriseApplications: ($enterpriseApplications[0] // []),
+          conditionalAccess: ($conditionalAccess[0] // {})
         },
         guest: ($guest[0] // {})
       }
     ' >"$REPORT_FILE"
 
   chmod 600 "$REPORT_FILE"
-  jq empty "$REPORT_FILE"
+  jq -e 'type == "object"' "$REPORT_FILE" >/dev/null
   log PASS "Diagnostic JSON report written to ${REPORT_FILE}"
 }
 
@@ -821,6 +1003,26 @@ write_html_report() {
           "<div class=\"line\"><span class=\"code pass\">[PASS]</span><span>No aggregated service errors returned.</span></div>"
         else
           map("<div class=\"line\"><span class=\"code warn\">[WARN]</span><span>\((.CodeSymbolic // "Unknown") | h): \((.Count // "0") | h) event(s), \((.Users // "0") | h) user(s), service_error=\((.ServiceError // "unknown") | h)</span></div>")
+          | join("\n")
+        end;
+    def enterprise_application_lines:
+      (.identity.enterpriseApplications // [])
+      | if length == 0 then
+          "<div class=\"line\"><span class=\"code info\">[INFO]</span><span>Enterprise application verification was not available.</span></div>"
+        else
+          map(
+            "<div class=\"line\"><span class=\"code \((if .accountEnabled == true then "pass" elif .accountEnabled == false then "fail" else "warn" end))\">[\((if .accountEnabled == true then "PASS" elif .accountEnabled == false then "FAIL" else "WARN" end))]</span><span>\(.name | h) (\(.appId | h)): account_enabled=\((.accountEnabled // "unknown") | h), rdp_protocol_enabled=\((.remoteDesktopProtocolEnabled // "not checked") | h)</span></div>"
+          )
+          | join("\n")
+        end;
+    def conditional_access_lines:
+      (.identity.conditionalAccess.applications // [])
+      | if length == 0 then
+          "<div class=\"line\"><span class=\"code info\">[INFO]</span><span>Conditional Access app targeting verification was not available.</span></div>"
+        else
+          map(
+            "<div class=\"line\"><span class=\"code info\">[INFO]</span><span>\(.name | h): effective_policies=\(.effectivePolicies | length), explicit_exclusions=\(.explicitExclusions | length)</span></div>"
+          )
           | join("\n")
         end;
     def count_status($status): [.findings[] | select(.status == $status)] | length;
@@ -870,6 +1072,8 @@ write_html_report() {
         <div class=\"datum\"><b class=\"info\">\(count_status("INFO")) INFO</b><span>informational</span></div>
       </div></section>
       <section><h2>Findings</h2>\(finding_lines)</section>
+      <section><h2>Enterprise applications</h2>\(enterprise_application_lines)</section>
+      <section><h2>Conditional Access app targeting</h2>\(conditional_access_lines)</section>
       <section><h2>Session-host health checks</h2>\(health_lines)</section>
       <section><h2>Aggregated monitoring evidence</h2>\(monitoring_lines)</section>
       <section><h2>Handling notice</h2><div class=\"notice\">This report contains customer environment identifiers and diagnostic details. Keep it inside the customer tenant and do not commit it to source control.</div></section>
@@ -893,10 +1097,13 @@ main() {
   printf '[]' >"$TMP_DIR/kql-error-summary.json"
   printf '[]' >"$TMP_DIR/kql-user-connection-flow.json"
   printf '[]' >"$TMP_DIR/entra-signins.json"
+  printf '[]' >"$TMP_DIR/entra-applications.json"
+  printf '{"queryStatus":"not-run","policies":[],"applications":[],"applicationFilterPolicies":[]}' >"$TMP_DIR/conditional-access.json"
   printf '{}' >"$TMP_DIR/guest-diagnostics.json"
 
   control_plane_audit
   log_analytics_audit
+  entra_application_audit
   entra_signin_audit
   guest_diagnostics
   write_report
