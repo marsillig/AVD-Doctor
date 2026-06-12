@@ -14,7 +14,7 @@ optional session-host checks without applying remediation changes.
 ## Download in Azure Cloud Shell
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.2/avd-doctor.sh
+curl -fsSLO https://raw.githubusercontent.com/marsillig/AVD-Doctor/v0.1.3/avd-doctor.sh
 chmod +x avd-doctor.sh
 ```
 
@@ -68,11 +68,14 @@ View all options:
 - `AuditLog.Read.All` or an equivalent Entra directory role only when sign-in
   diagnostics are requested with `--upn`.
 
-## Report
+## Reports
 
-The JSON report is saved under `$HOME` with file permissions set to `600`.
-Reports contain sensitive Azure environment metadata and should be handled
-securely.
+The script saves a JSON report and a readable TUI-style HTML report under
+`$HOME`. Both files are created with permissions set to `600`.
+
+Reports contain customer Azure environment identifiers and diagnostic details.
+Keep them inside the customer tenant, handle them securely, and do not commit
+them to source control.
 
 ## Support
 

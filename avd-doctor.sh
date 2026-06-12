@@ -13,7 +13,7 @@ set +x
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly VERSION="0.1.2"
+readonly VERSION="0.1.3"
 readonly API_VERSION="2024-04-03"
 readonly GRAPH_URL="https://graph.microsoft.com/v1.0"
 readonly LOOKBACK_HOURS=24
@@ -28,6 +28,7 @@ NO_COLOR="${NO_COLOR:-}"
 
 TMP_DIR=""
 REPORT_FILE=""
+HTML_REPORT_FILE=""
 HOST_POOL_ID=""
 RESOURCE_GROUP_ID=""
 SELECTED_VM_ID=""
@@ -203,6 +204,7 @@ initialize() {
   local timestamp
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   REPORT_FILE="${HOME}/avd-diagnostics-${HOST_POOL//[^A-Za-z0-9_.-]/_}-${timestamp}.json"
+  HTML_REPORT_FILE="${HOME}/avd-diagnostics-${HOST_POOL//[^A-Za-z0-9_.-]/_}-${timestamp}.html"
 
   if ! az account show --only-show-errors --output none 2>"$TMP_DIR/account.err"; then
     die "Azure CLI is not authenticated. Run 'az login' or use an authenticated Cloud Shell."
@@ -789,6 +791,99 @@ write_report() {
   log PASS "Diagnostic JSON report written to ${REPORT_FILE}"
 }
 
+write_html_report() {
+  jq -r '
+    def h: tostring | @html;
+    def status_class:
+      if . == "PASS" then "pass"
+      elif . == "WARN" then "warn"
+      elif . == "FAIL" then "fail"
+      else "info"
+      end;
+    def finding_lines:
+      .findings
+      | map("<div class=\"line\"><span class=\"code \(.status | status_class)\">[\(.status | h)]</span><span>\(.message | h)</span></div>")
+      | join("\n");
+    def health_lines:
+      .controlPlane.sessionHosts
+      | map(
+          . as $host
+          | ($host.healthCheckResults // [])
+          | map(
+              "<div class=\"line\"><span class=\"code \((if .healthCheckResult == "HealthCheckSucceeded" then "pass" else "warn" end))\">[\((if .healthCheckResult == "HealthCheckSucceeded" then "PASS" else "WARN" end))]</span><span>\($host.name | h) / \(.healthCheckName | h): \(.healthCheckResult | h)\((if (.additionalFailureDetails.message // "") != "" then " — " + (.additionalFailureDetails.message | h) else "" end))</span></div>"
+            )
+          | join("\n")
+        )
+      | join("\n");
+    def monitoring_lines:
+      (.monitoring.errorSummary // [])
+      | if length == 0 then
+          "<div class=\"line\"><span class=\"code pass\">[PASS]</span><span>No aggregated service errors returned.</span></div>"
+        else
+          map("<div class=\"line\"><span class=\"code warn\">[WARN]</span><span>\((.CodeSymbolic // "Unknown") | h): \((.Count // "0") | h) event(s), \((.Users // "0") | h) user(s), service_error=\((.ServiceError // "unknown") | h)</span></div>")
+          | join("\n")
+        end;
+    def count_status($status): [.findings[] | select(.status == $status)] | length;
+    def first_host: (.controlPlane.sessionHosts[0] // {});
+    "<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>AVD Doctor — \(.scope.hostPool | h)</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b0f14;--surface:#10161d;--line:#2a3440;--text:#d9e2ec;--muted:#8492a2;--green:#56d364;--amber:#e3b341;--red:#f47067;--blue:#58a6ff}
+    *{box-sizing:border-box}body{margin:0;color:var(--text);background:var(--bg);font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,\"Liberation Mono\",monospace}
+    .shell{width:min(1080px,calc(100% - 32px));margin:24px auto 48px;border:1px solid var(--line);background:var(--surface)}
+    header{display:flex;justify-content:space-between;gap:20px;padding:12px 16px;border-bottom:1px solid var(--line);color:var(--muted)}header strong{color:var(--text)}
+    main{padding:18px 20px 24px}.command{margin:0 0 20px;color:var(--text)}.prompt,.pass{color:var(--green)}.flag,.info,h2{color:var(--blue)}.warn,.state{color:var(--amber)}.fail{color:var(--red)}
+    h1,h2,p{margin-top:0}h1{margin-bottom:7px;font-size:20px}h2{margin-bottom:13px;font-size:14px;text-transform:uppercase}.muted{color:var(--muted)}
+    section{margin-top:24px;border-top:1px solid var(--line);padding-top:18px}.summary{display:grid;grid-template-columns:180px 1fr;gap:5px 16px;margin-top:18px}.summary dt{color:var(--muted)}.summary dd{margin:0;overflow-wrap:anywhere}
+    .data{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line)}.datum{padding:11px 13px;border-right:1px solid var(--line)}.datum:last-child{border-right:0}.datum b{display:block;font-size:17px}.datum span{color:var(--muted);font-size:12px}
+    .line{display:grid;grid-template-columns:76px 1fr;gap:13px;padding:6px 0}.code{font-weight:700}.notice{padding:12px 14px;border-left:3px solid var(--amber);background:#171710}
+    footer{padding:13px 16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+    @media(max-width:700px){.shell{width:calc(100% - 16px);margin-top:8px}header{display:block}header span{display:block;margin-top:3px}main{padding:15px 13px 20px}.summary{grid-template-columns:125px 1fr}.data{grid-template-columns:repeat(2,1fr)}.datum:nth-child(2){border-right:0}.datum:nth-child(-n+2){border-bottom:1px solid var(--line)}.line{grid-template-columns:68px 1fr}}
+  </style>
+</head>
+<body>
+  <div class=\"shell\">
+    <header><strong>AVD Doctor / diagnostic-report</strong><span>tenant-local report · contains customer data</span></header>
+    <main>
+      <p class=\"command\"><span class=\"prompt\">$</span> avd-doctor report <span class=\"flag\">--format html</span></p>
+      <h1>AVD diagnostic report: \(.scope.hostPool | h)</h1>
+      <p class=\"muted\">Read-only assessment generated by AVD Doctor \(.toolVersion | h).</p>
+      <dl class=\"summary\">
+        <dt>generated_utc</dt><dd>\(.generatedAtUtc | h)</dd>
+        <dt>subscription_id</dt><dd>\(.scope.subscriptionId | h)</dd>
+        <dt>resource_group</dt><dd>\(.scope.resourceGroup | h)</dd>
+        <dt>host_pool</dt><dd>\(.scope.hostPool | h)</dd>
+        <dt>selected_vm</dt><dd>\((.scope.selectedVm // "not selected") | h)</dd>
+        <dt>location</dt><dd>\(.controlPlane.hostPool.location | h)</dd>
+        <dt>host_pool_type</dt><dd>\(.controlPlane.hostPool.hostPoolType | h)</dd>
+        <dt>load_balancer</dt><dd>\(.controlPlane.hostPool.loadBalancerType | h)</dd>
+        <dt>workspace_resource_id</dt><dd>\((.scope.logAnalyticsWorkspaceResourceId // "not resolved") | h)</dd>
+      </dl>
+      <section><h2>Check summary</h2><div class=\"data\">
+        <div class=\"datum\"><b class=\"pass\">\(count_status("PASS")) PASS</b><span>checks succeeded</span></div>
+        <div class=\"datum\"><b class=\"warn\">\(count_status("WARN")) WARN</b><span>review required</span></div>
+        <div class=\"datum\"><b class=\"fail\">\(count_status("FAIL")) FAIL</b><span>critical findings</span></div>
+        <div class=\"datum\"><b class=\"info\">\(count_status("INFO")) INFO</b><span>informational</span></div>
+      </div></section>
+      <section><h2>Findings</h2>\(finding_lines)</section>
+      <section><h2>Session-host health checks</h2>\(health_lines)</section>
+      <section><h2>Aggregated monitoring evidence</h2>\(monitoring_lines)</section>
+      <section><h2>Handling notice</h2><div class=\"notice\">This report contains customer environment identifiers and diagnostic details. Keep it inside the customer tenant and do not commit it to source control.</div></section>
+    </main>
+    <footer>[CUSTOMER DATA] Generated locally from the JSON diagnostic report. No information was uploaded by AVD Doctor.</footer>
+  </div>
+</body>
+</html>"
+  ' "$REPORT_FILE" >"$HTML_REPORT_FILE"
+
+  chmod 600 "$HTML_REPORT_FILE"
+  log PASS "Diagnostic HTML report written to ${HTML_REPORT_FILE}"
+}
+
 main() {
   parse_args "$@"
   initialize
@@ -805,6 +900,7 @@ main() {
   entra_signin_audit
   guest_diagnostics
   write_report
+  write_html_report
 }
 
 main "$@"

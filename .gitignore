@@ -1,6 +1,8 @@
 # AVD Doctor diagnostic output contains client environment metadata.
 avd-diagnostics-*.json
+avd-diagnostics-*.html
 avd-diagnostics-*/
+.avd-doctor-html-demo.html
 
 # Local environment, credentials, and secret material.
 .env
